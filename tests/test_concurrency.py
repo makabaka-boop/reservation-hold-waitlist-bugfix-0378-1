@@ -78,7 +78,7 @@ def test_concurrent_then_expire_promotes_exactly_one(client, n=16):
     def attempt(i):
         local = TestClient(client.app)
         barrier.wait()
-        return _book(local, 0, 0, 10, ttl=1)
+        return _book(local, 0, 10, 20, ttl=1)
 
     with ThreadPoolExecutor(max_workers=n) as pool:
         list(pool.map(attempt, range(n)))

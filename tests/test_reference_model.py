@@ -73,12 +73,26 @@ class ReferenceModel:
             key=lambda b: b.id,
         )
         for b in waiting:
+            if b.start_tick < self.now:
+                continue
             if self._overlap(room, b.start_tick, b.end_tick):
                 continue
             b.status = "held"
             b.expires_at = self.now + PROMOTION_TTL
             promoted.append(b.dict())
         return promoted
+
+    def _expire_stale_waiting(self, room=None):
+        stale = sorted(
+            (b for b in self.bookings.values()
+             if b.status == "waiting" and b.start_tick < self.now
+             and (room is None or b.room == room)),
+            key=lambda b: b.id,
+        )
+        for b in stale:
+            b.status = "expired"
+            b.expires_at = None
+        return stale
 
     # 每个操作对应一个事务，返回 (status_code, body)
     def create(self, room, s, e, ttl, key, fp):
@@ -90,7 +104,7 @@ class ReferenceModel:
             return code, body
 
         code, body = 201, None
-        if not (0 <= room < ROOMS) or ttl <= 0 or s >= e:
+        if not (0 <= room < ROOMS) or ttl <= 0 or s >= e or s < self.now:
             code, body = 400, {"error": {"code": "validation_error", "message": "x"}}
         else:
             if self._overlap(room, s, e):
@@ -128,6 +142,7 @@ class ReferenceModel:
         b.expires_at = None
         promoted = {}
         if was_active:
+            self._expire_stale_waiting(b.room)
             p = self._scan(b.room)
             if p:
                 promoted[str(b.room)] = p
@@ -144,6 +159,7 @@ class ReferenceModel:
         if s < b.start_tick or e > b.end_tick:
             return 400, {"error": {"code": "validation_error", "message": "x"}}
         b.start_tick, b.end_tick = s, e
+        self._expire_stale_waiting(b.room)
         p = self._scan(b.room)
         promoted = {str(b.room): p} if p else {}
         return 200, {"booking": b.dict(), "promoted": promoted}
@@ -165,6 +181,8 @@ class ReferenceModel:
         for b in expired:
             b.status = "expired"
             b.expires_at = None
+        stale_waiting = self._expire_stale_waiting()
+        expired = sorted([*expired, *stale_waiting], key=lambda b: b.id)
         promoted = {}
         for room in sorted({b.room for b in expired}):
             p = self._scan(room)
@@ -225,6 +243,8 @@ def assert_invariants(ref):
     # 3. 候补按 id FIFO
     waiting = [b for b in ref.bookings.values() if b.status == "waiting"]
     assert [b.id for b in waiting] == sorted(b.id for b in waiting)
+    # 4. 候补必须仍可完整使用未来时段
+    assert all(b.start_tick >= ref.now for b in waiting)
 
 
 # ---------------- 差分测试 ----------------

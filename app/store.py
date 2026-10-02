@@ -3,7 +3,7 @@
 约定：
 - 区间为半开整数区间 [start_tick, end_tick)，相邻区间（a.end == b.start）不冲突；
 - 冲突只在同一房间内判定（不同房间的相同时间段互不影响）；
-- 候补按自增 id（即入队顺序）FIFO；
+- 候补按自增 id（即入队顺序）FIFO；时钟越过 start_tick 后离开 FIFO 并终态化；
 - 本模块的每个公开操作都在调用方开启的 IMMEDIATE 事务内完成
   "释放容量 + 扫描候补 + 晋升"，保证原子性。
 """
@@ -109,6 +109,8 @@ class Store:
             raise ValidationError(f"房间号必须在 0..{self.room_count() - 1} 之间")
         if ttl <= 0:
             raise ValidationError("ttl 必须为正整数")
+        if start < now:
+            raise ValidationError("预约开始时间不得早于当前时钟")
 
         overlap = self._has_overlap(room, start, end)
         status = "waiting" if overlap else "held"
@@ -120,10 +122,45 @@ class Store:
         )
         return _booking_dict(cur.fetchone())
 
+    def _expire_stale_waiting(
+        self, now: int, room: int | None = None
+    ) -> list[sqlite3.Row]:
+        """将开始时刻已经过去的候补置为 expired。
+
+        半开区间在 start_tick 当时仍可使用；一旦 now > start_tick，
+        该候补已无法获得完整的未来时段，必须离开 FIFO，不能再被晋升。
+        """
+        if room is None:
+            rows = self.conn.execute(
+                "SELECT * FROM bookings WHERE status='waiting' AND start_tick < ?"
+                " ORDER BY id ASC",
+                (now,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM bookings WHERE status='waiting' AND room=? AND start_tick < ?"
+                " ORDER BY id ASC",
+                (room, now),
+            ).fetchall()
+        if rows:
+            ids = [r["id"] for r in rows]
+            placeholders = ",".join("?" * len(ids))
+            self.conn.execute(
+                f"UPDATE bookings SET status='expired', expires_at=NULL"
+                f" WHERE id IN ({placeholders})",
+                ids,
+            )
+            rows = self.conn.execute(
+                f"SELECT * FROM bookings WHERE id IN ({placeholders}) ORDER BY id ASC",
+                ids,
+            ).fetchall()
+        return rows
+
     def _scan_waitlist(self, room: int, ttl: int, now: int) -> list[dict[str, Any]]:
         """按入队顺序扫描某房间的候补，晋升当前能**完整**容纳的申请。
 
         不拆分时段：放不下就保留其 waiting 状态并继续检查后面的申请。
+        已跨过开始时刻的申请不能晋升；正常流程会先将其终态化。
         """
         promoted: list[dict[str, Any]] = []
         waiting = self.conn.execute(
@@ -131,6 +168,8 @@ class Store:
             (room,),
         ).fetchall()
         for row in waiting:
+            if row["start_tick"] < now:
+                continue
             if self._has_overlap(room, row["start_tick"], row["end_tick"]):
                 continue
             expires_at = now + ttl
@@ -170,6 +209,7 @@ class Store:
         promoted: dict[int, list[dict[str, Any]]] = {}
         # waiting 取消不释放容量；held/reserved 取消才可能腾出空档。
         if row["status"] in ACTIVE:
+            self._expire_stale_waiting(now, row["room"])
             room_promoted = self._scan_waitlist(row["room"], ttl, now)
             if room_promoted:
                 promoted[row["room"]] = room_promoted
@@ -198,6 +238,7 @@ class Store:
             "UPDATE bookings SET start_tick=?, end_tick=? WHERE id=?",
             (new_start, new_end, booking_id),
         )
+        self._expire_stale_waiting(now, row["room"])
         room_promoted = self._scan_waitlist(row["room"], ttl, now)
         promoted = {row["room"]: room_promoted} if room_promoted else {}
         return {"booking": self.get_booking(booking_id), "promoted": promoted}
@@ -205,7 +246,7 @@ class Store:
     def expire_holds(
         self, ttl: int, now: int
     ) -> tuple[list[dict[str, Any]], dict[int, list[dict[str, Any]]]]:
-        """过期所有 expires_at <= now 的 held，再逐房间扫描候补。
+        """过期超时 held 与已越过开始点的 waiting，再逐房间扫描候补。
 
         与时钟推进在同一事务中完成。
         """
@@ -233,9 +274,15 @@ class Store:
             if expired_ids
             else []
         )
-        expired = [_booking_dict(r) for r in expired_rows]
 
-        affected_rooms = sorted({r["room"] for r in expired_rows})
+        # 时钟跨过候补时段的开始点后，候补也无法再完整使用未来容量。
+        stale_waiting_rows = self._expire_stale_waiting(now)
+        all_expired_rows = sorted(
+            [*expired_rows, *stale_waiting_rows], key=lambda r: r["id"]
+        )
+        expired = [_booking_dict(r) for r in all_expired_rows]
+
+        affected_rooms = sorted({r["room"] for r in all_expired_rows})
         promoted: dict[int, list[dict[str, Any]]] = {}
         for room in affected_rooms:
             room_promoted = self._scan_waitlist(room, ttl, now)

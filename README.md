@@ -12,13 +12,16 @@
 - 状态机：
   - `held`：限时保留，`expires_at = 创建时刻 + ttl`；
   - `reserved`：已确认，永不过期；
-  - `waiting`：候补，按自增 id（入队顺序）FIFO；
+  - `waiting`：候补，按自增 id（入队顺序）FIFO；时钟越过其 `start_tick`
+    后即无法完整使用时段，终态化为 `expired`，不再参与晋升；
   - `expired` / `cancelled`：终态。
 - **过期判定**：时钟推进到 `t` 时，所有 `expires_at <= t` 的 held 过期。
   过期、扫描、晋升与时钟更新在同一 `BEGIN IMMEDIATE` 事务中完成。
-- **候补晋升**：候补按 FIFO 逐个检查，能完整放进当前空档才晋升为 held
-  （`expires_at = 当前时刻 + PROMOTION_TTL`）；放不下则保留 waiting 并继续
+- **候补晋升**：候补按 FIFO 逐个检查，只有 `start_tick >= 当前时钟` 且能完整
+  放进当前空档才晋升为 held（`expires_at = 当前时刻 + PROMOTION_TTL`）；
+  已跨过开始点的候补先终态化为 expired，放不下的未来候补保留 waiting 并继续
   检查后面的申请——不拆分、不丢弃顺序。
+- 新建申请的 `start_tick` 不得早于当前时钟。
 - **取消/缩短**：仅 held/reserved 释放容量并触发同房间候补扫描；
   取消 waiting 不释放容量。缩短只允许在原区间范围内收紧。
 - **并发**：所有写事务均为 `BEGIN IMMEDIATE`，SQLite 库级写锁将冲突申请

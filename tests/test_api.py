@@ -103,9 +103,9 @@ def test_scan_continues_past_non_fitting_entries(client):
 def test_expiry_chain_on_clock_advance(client):
     # held [0,100) ttl=3 -> 3 个候补排成链
     create(client, 0, 0, 100, ttl=3)
-    w1 = create(client, 0, 0, 100)
-    w2 = create(client, 0, 0, 100)
-    w3 = create(client, 0, 0, 100)
+    w1 = create(client, 0, 100, 200)
+    w2 = create(client, 0, 100, 200)
+    w3 = create(client, 0, 100, 200)
 
     r = client.post("/clock/advance", json={"ticks": 3})
     body = r.json()
@@ -130,6 +130,101 @@ def test_expiry_chain_on_clock_advance(client):
     r = client.post("/clock/advance", json={"ticks": 100})
     assert r.json()["promoted"] == {}
     assert by_id(state(client))[w3["id"]]["status"] == "waiting"
+
+
+def test_clock_across_waitlist_start_does_not_promote_stale_waiter(client):
+    holder = create(client, 0, 0, 10, ttl=10)
+    stale = create(client, 0, 5, 15)
+    future = create(client, 0, 5, 25)
+
+    # 直接从上午跳到下午：holder 的保留截止点和 stale 的时段开始点都已越过。
+    body = client.post("/clock/advance", json={"to": 15}).json()
+    assert [b["id"] for b in body["expired"]] == [holder["id"], stale["id"]]
+    assert body["promoted"] == {}
+
+    st = by_id(state(client))
+    assert st[holder["id"]]["status"] == "expired"
+    assert st[stale["id"]]["status"] == "expired"
+    assert st[future["id"]]["status"] == "waiting"
+    assert client.post(f"/bookings/{stale['id']}/confirm").status_code == 409
+    assert client.post("/bookings", json={
+        "room": 0, "start_tick": 14, "end_tick": 16, "ttl": 5,
+    }).status_code == 400
+
+
+def test_fifo_scan_skips_expired_waiters_and_promotes_later_fit(client):
+    holder = create(client, 0, 0, 20, ttl=1)
+    stale = create(client, 0, 0, 100)
+    fit = create(client, 0, 15, 30)
+    later = create(client, 0, 25, 30)
+
+    body = client.post("/clock/advance", json={"to": 10}).json()
+    assert [b["id"] for b in body["expired"]] == [holder["id"], stale["id"]]
+    assert [p["id"] for p in body["promoted"]["0"]] == [fit["id"]]
+
+    st = by_id(state(client))
+    assert st[fit["id"]]["status"] == "held"
+    assert st[fit["id"]]["expires_at"] == 15
+    assert st[later["id"]]["status"] == "waiting"
+
+
+def test_cancel_active_after_clock_jump_expires_stale_before_promoting(client):
+    holder = create(client, 0, 0, 20, ttl=100)
+    stale = create(client, 0, 5, 25)
+    fit = create(client, 0, 15, 25)
+
+    client.post("/clock/advance", json={"to": 10})
+    body = client.post(f"/bookings/{holder['id']}/cancel").json()
+    assert body["booking"]["status"] == "cancelled"
+    assert [p["id"] for p in body["promoted"]["0"]] == [fit["id"]]
+    assert by_id(state(client))[stale["id"]]["status"] == "expired"
+
+
+def test_clock_jump_expires_waiters_in_multiple_rooms(client):
+    h0 = create(client, 0, 0, 10, ttl=10)
+    w0 = create(client, 0, 5, 15)
+    w1 = create(client, 1, 5, 15)
+
+    body = client.post("/clock/advance", json={"to": 12}).json()
+    assert [b["id"] for b in body["expired"]] == [h0["id"], w0["id"], w1["id"]]
+    assert body["promoted"] == {}
+    st = by_id(state(client))
+    assert st[w0["id"]]["status"] == "expired"
+    assert st[w1["id"]]["status"] == "expired"
+
+
+def test_idempotent_clock_replay_does_not_repromote_expired_waiter(client):
+    holder = create(client, 0, 0, 10, ttl=5)
+    waiter = create(client, 0, 5, 15)
+
+    first = client.post(
+        "/clock/advance",
+        json={"to": 10},
+        headers={"Idempotency-Key": "jump"},
+    )
+    assert first.status_code == 200
+    replay = client.post(
+        "/clock/advance",
+        json={"to": 10},
+        headers={"Idempotency-Key": "jump"},
+    )
+    assert replay.json() == first.json()
+    assert by_id(state(client))[waiter["id"]]["status"] == "expired"
+    assert client.post(f"/bookings/{waiter['id']}/confirm").status_code == 409
+
+def test_shorten_after_clock_jump_expires_stale_before_promoting(client):
+    holder = create(client, 0, 0, 30, ttl=100)
+    stale = create(client, 0, 5, 15)
+    fit = create(client, 0, 20, 30)
+
+    client.post("/clock/advance", json={"to": 10})
+    body = client.post(
+        f"/bookings/{holder['id']}/shorten",
+        json={"start_tick": 0, "end_tick": 20},
+    ).json()
+    assert body["booking"]["end_tick"] == 20
+    assert [p["id"] for p in body["promoted"]["0"]] == [fit["id"]]
+    assert by_id(state(client))[stale["id"]]["status"] == "expired"
 
 
 def test_shorten_releases_tail_and_promotes(client):
