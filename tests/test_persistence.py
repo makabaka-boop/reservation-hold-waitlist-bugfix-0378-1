@@ -13,20 +13,20 @@ def test_restart_preserves_everything(tmp_path):
 
     c = fresh()
     # held ttl=10，候补两人，另一房间一条 reserved
-    h = c.post("/bookings", json={"room": 0, "start_tick": 0, "end_tick": 100, "ttl": 10}).json()
-    w1 = c.post("/bookings", json={"room": 0, "start_tick": 0, "end_tick": 60, "ttl": 1000}).json()
-    w2 = c.post("/bookings", json={"room": 0, "start_tick": 60, "end_tick": 100, "ttl": 1000}).json()
-    r = c.post("/bookings", json={"room": 1, "start_tick": 0, "end_tick": 5, "ttl": 10}).json()
+    h = c.post("/bookings", json={"room": 0, "start_tick": 100, "end_tick": 200, "ttl": 10}).json()
+    w1 = c.post("/bookings", json={"room": 0, "start_tick": 100, "end_tick": 160, "ttl": 1000}).json()
+    w2 = c.post("/bookings", json={"room": 0, "start_tick": 160, "end_tick": 200, "ttl": 1000}).json()
+    r = c.post("/bookings", json={"room": 1, "start_tick": 100, "end_tick": 105, "ttl": 10}).json()
     c.post(f"/bookings/{r['id']}/confirm")
 
-    # 缩短为 [0,50)：w1 [0,60) 放不下；w2 [60,100) 能放进腾出的尾部，被晋升
-    sh = c.post(f"/bookings/{h['id']}/shorten", json={"start_tick": 0, "end_tick": 50})
+    # 缩短为 [100,150)：w1 [100,160) 放不下；w2 [160,200) 能放进腾出的尾部，被晋升
+    sh = c.post(f"/bookings/{h['id']}/shorten", json={"start_tick": 100, "end_tick": 150})
     assert [p["id"] for p in sh.json()["promoted"].get("0", [])] == [w2["id"]]
 
     # 幂等键首次结果
     k1 = c.post(
         "/bookings",
-        json={"room": 1, "start_tick": 50, "end_tick": 60, "ttl": 10},
+        json={"room": 1, "start_tick": 150, "end_tick": 160, "ttl": 10},
         headers={"Idempotency-Key": "k1"},
     ).json()
 
@@ -41,7 +41,7 @@ def test_restart_preserves_everything(tmp_path):
     # 幂等键重放原结果（连 id 都不变）
     again = c2.post(
         "/bookings",
-        json={"room": 1, "start_tick": 50, "end_tick": 60, "ttl": 10},
+        json={"room": 1, "start_tick": 150, "end_tick": 160, "ttl": 10},
         headers={"Idempotency-Key": "k1"},
     )
     assert again.status_code == 201
@@ -49,18 +49,18 @@ def test_restart_preserves_everything(tmp_path):
     # 同键换载荷仍然拒绝
     conflict = c2.post(
         "/bookings",
-        json={"room": 1, "start_tick": 50, "end_tick": 61, "ttl": 10},
+        json={"room": 1, "start_tick": 150, "end_tick": 161, "ttl": 10},
         headers={"Idempotency-Key": "k1"},
     )
     assert conflict.status_code == 409
 
-    # 先推进到 5：w2（晋升保留 ttl=5）过期；h 仍持有 [0,50)，w1 仍放不下
+    # 先推进到 5：w2（晋升保留 ttl=5）过期；h 仍持有 [100,150)，w1 仍放不下
     body = c2.post("/clock/advance", json={"to": 5}).json()
     assert [b["id"] for b in body["expired"]] == [w2["id"]]
     assert body["promoted"] == {}
 
     # 再推进到 10：h（ttl=10）与房间1的 k1（held ttl=10）同时过期；
-    # 房间0 上 w1 [0,60) 完整放下，一次晋升
+    # 房间0 上 w1 [100,160) 完整放下，一次晋升
     body = c2.post("/clock/advance", json={"to": 10}).json()
     assert [b["id"] for b in body["expired"]] == [h["id"], k1["id"]]
     assert [p["id"] for p in body["promoted"]["0"]] == [w1["id"]]

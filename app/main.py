@@ -146,7 +146,7 @@ def create_app(
         idem_key: str | None = Header(default=None, alias=IdemHeader),
     ):
         def action(s: Store, now: int) -> tuple[int, Any]:
-            return 200, s.confirm_booking(booking_id)
+            return 200, s.confirm_booking(booking_id, now)
 
         status, payload = await _mutate(request, store, idem_key, None, action)
         response.status_code = status

@@ -58,7 +58,7 @@ def test_concurrent_same_idempotency_key_single_booking(client, n=16):
     def attempt(i):
         local = TestClient(client.app)
         barrier.wait()
-        return _book(local, 1, 0, 5, key="same-key")
+        return _book(local, 1, 10, 15, key="same-key")
 
     with ThreadPoolExecutor(max_workers=n) as pool:
         results = list(pool.map(attempt, range(n)))
@@ -78,7 +78,7 @@ def test_concurrent_then_expire_promotes_exactly_one(client, n=16):
     def attempt(i):
         local = TestClient(client.app)
         barrier.wait()
-        return _book(local, 0, 0, 10, ttl=1)
+        return _book(local, 0, 10, 20, ttl=1)
 
     with ThreadPoolExecutor(max_workers=n) as pool:
         list(pool.map(attempt, range(n)))
@@ -94,3 +94,25 @@ def test_concurrent_then_expire_promotes_exactly_one(client, n=16):
     for b in st["bookings"]:
         counts[b["status"]] = counts.get(b["status"], 0) + 1
     assert counts == {"expired": 1, "held": 1, "waiting": n - 2}
+
+
+def test_concurrent_stale_waiters_expire_together_on_clock_jump(client, n=16):
+    barrier = threading.Barrier(n)
+
+    def attempt(i):
+        local = TestClient(client.app)
+        barrier.wait()
+        return _book(local, 0, 10, 20, ttl=1000)
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        list(pool.map(attempt, range(n)))
+
+    r = client.post("/clock/advance", json={"to": 10})
+    expired = {b["id"] for b in r.json()["expired"]}
+    assert len(expired) == n
+    assert r.json()["promoted"] == {}
+    st = client.get("/state").json()
+    counts = {}
+    for b in st["bookings"]:
+        counts[b["status"]] = counts.get(b["status"], 0) + 1
+    assert counts == {"expired": n}

@@ -5,7 +5,7 @@
 - 冲突只在同一房间内判定（不同房间的相同时间段互不影响）；
 - 候补按自增 id（即入队顺序）FIFO；
 - 本模块的每个公开操作都在调用方开启的 IMMEDIATE 事务内完成
-  "释放容量 + 扫描候补 + 晋升"，保证原子性。
+  "释放容量 + 扫描候补 + 晋升"（时钟推进还会同事务终态化过期候补），保证原子性。
 """
 
 from __future__ import annotations
@@ -17,6 +17,11 @@ from .errors import ConflictError, NotFoundError, ValidationError
 
 ACTIVE = ("held", "reserved")
 TERMINAL = ("expired", "cancelled")
+
+
+def _is_held_current(row: sqlite3.Row, now: int) -> bool:
+    """held 是否仍与当前时钟相容。"""
+    return row["start_tick"] >= now and row["expires_at"] > now
 
 
 def _booking_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -107,6 +112,8 @@ class Store:
         """申请：有空档则取得限时保留(held)，否则进入候补(waiting)。"""
         if not 0 <= room < self.room_count():
             raise ValidationError(f"房间号必须在 0..{self.room_count() - 1} 之间")
+        if start < now:
+            raise ValidationError("不可预约起点已经过去的时段")
         if ttl <= 0:
             raise ValidationError("ttl 必须为正整数")
 
@@ -123,12 +130,14 @@ class Store:
     def _scan_waitlist(self, room: int, ttl: int, now: int) -> list[dict[str, Any]]:
         """按入队顺序扫描某房间的候补，晋升当前能**完整**容纳的申请。
 
-        不拆分时段：放不下就保留其 waiting 状态并继续检查后面的申请。
+        不拆分时段：未来候选项放不下就保留 waiting，并继续检查后面的申请；
+        start_tick 已经被时钟越过的候选项已在时钟推进时终态化。
         """
         promoted: list[dict[str, Any]] = []
         waiting = self.conn.execute(
-            "SELECT * FROM bookings WHERE room=? AND status='waiting' ORDER BY id ASC",
-            (room,),
+            "SELECT * FROM bookings WHERE room=? AND status='waiting'"
+            " AND start_tick >= ? ORDER BY id ASC",
+            (room, now),
         ).fetchall()
         for row in waiting:
             if self._has_overlap(room, row["start_tick"], row["end_tick"]):
@@ -144,13 +153,15 @@ class Store:
             promoted.append(_booking_dict(updated))
         return promoted
 
-    def confirm_booking(self, booking_id: int) -> dict[str, Any]:
-        """确认保留 -> 预约。只接受 held。"""
+    def confirm_booking(self, booking_id: int, now: int) -> dict[str, Any]:
+        """确认保留 -> 预约。只接受当前仍有效的 held。"""
         row = self.get_booking_row(booking_id)
         if row["status"] == "reserved":
             raise ConflictError("该保留已确认，无需重复确认")
         if row["status"] != "held":
             raise ConflictError(f"当前状态 {row['status']} 不可确认，仅 held 可确认")
+        if not _is_held_current(row, now):
+            raise ConflictError("该保留已随当前时钟过期，不可确认")
         self.conn.execute(
             "UPDATE bookings SET status='reserved', expires_at=NULL WHERE id=?",
             (booking_id,),
@@ -193,6 +204,8 @@ class Store:
             raise ValidationError("必须满足 start_tick < end_tick")
         if new_start < row["start_tick"] or new_end > row["end_tick"]:
             raise ValidationError("只允许在原时段范围内缩短，不得扩张或平移出界")
+        if new_start < now or new_end <= now:
+            raise ValidationError("缩短后的时段必须仍处于当前时钟之后")
 
         self.conn.execute(
             "UPDATE bookings SET start_tick=?, end_tick=? WHERE id=?",
@@ -205,40 +218,37 @@ class Store:
     def expire_holds(
         self, ttl: int, now: int
     ) -> tuple[list[dict[str, Any]], dict[int, list[dict[str, Any]]]]:
-        """过期所有 expires_at <= now 的 held，再逐房间扫描候补。
+        """将所有与当前时钟不相容的保留/候补置为 expired，再逐房间扫描候补。
 
-        与时钟推进在同一事务中完成。
+        held 到保留截止点，或其预约时段起点已经被时钟越过时过期；waiting
+        一旦不能再取得完整未来时段（start_tick < now）也立即进入终态。候补
+        终态化不释放容量，只有过期 held 所在房间才触发晋升扫描。
         """
-        expired_ids = [
-            r["id"]
-            for r in self.conn.execute(
-                "SELECT id FROM bookings WHERE status='held' AND expires_at <= ?"
-                " ORDER BY id ASC",
-                (now,),
-            ).fetchall()
-        ]
-        if expired_ids:
+        held_rows = list(
             self.conn.execute(
                 "UPDATE bookings SET status='expired', expires_at=NULL"
-                " WHERE status='held' AND expires_at <= ?",
-                (now,),
-            )
-        # 更新之后再读取，返回内容与最终状态一致。
-        placeholders = ",".join("?" * len(expired_ids))
-        expired_rows = (
-            self.conn.execute(
-                f"SELECT * FROM bookings WHERE id IN ({placeholders}) ORDER BY id ASC",
-                expired_ids,
+                " WHERE status='held' AND (expires_at <= ? OR start_tick < ?)"
+                " RETURNING *",
+                (now, now),
             ).fetchall()
-            if expired_ids
-            else []
         )
-        expired = [_booking_dict(r) for r in expired_rows]
+        stale_wait_rows = list(
+            self.conn.execute(
+                "UPDATE bookings SET status='expired', expires_at=NULL"
+                " WHERE status='waiting' AND start_tick < ?"
+                " RETURNING *",
+                (now,),
+            ).fetchall()
+        )
+        expired_rows = sorted(
+            (_booking_dict(row) for row in held_rows + stale_wait_rows),
+            key=lambda booking: booking["id"],
+        )
 
-        affected_rooms = sorted({r["room"] for r in expired_rows})
+        affected_rooms = sorted({row["room"] for row in held_rows})
         promoted: dict[int, list[dict[str, Any]]] = {}
         for room in affected_rooms:
             room_promoted = self._scan_waitlist(room, ttl, now)
             if room_promoted:
                 promoted[room] = room_promoted
-        return expired, promoted
+        return expired_rows, promoted

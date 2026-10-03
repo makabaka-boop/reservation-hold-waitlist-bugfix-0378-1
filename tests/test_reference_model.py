@@ -73,6 +73,8 @@ class ReferenceModel:
             key=lambda b: b.id,
         )
         for b in waiting:
+            if b.start_tick < self.now:
+                continue
             if self._overlap(room, b.start_tick, b.end_tick):
                 continue
             b.status = "held"
@@ -90,7 +92,7 @@ class ReferenceModel:
             return code, body
 
         code, body = 201, None
-        if not (0 <= room < ROOMS) or ttl <= 0 or s >= e:
+        if not (0 <= room < ROOMS) or ttl <= 0 or s >= e or s < self.now:
             code, body = 400, {"error": {"code": "validation_error", "message": "x"}}
         else:
             if self._overlap(room, s, e):
@@ -112,6 +114,8 @@ class ReferenceModel:
         if b.status == "reserved":
             return 409, {"error": {"code": "conflict", "message": "x"}}
         if b.status != "held":
+            return 409, {"error": {"code": "conflict", "message": "x"}}
+        if b.start_tick < self.now or b.expires_at <= self.now:
             return 409, {"error": {"code": "conflict", "message": "x"}}
         b.status = "reserved"
         b.expires_at = None
@@ -141,7 +145,7 @@ class ReferenceModel:
             return 409, {"error": {"code": "conflict", "message": "x"}}
         if s >= e:
             return 400, {"error": {"code": "validation_error", "message": "x"}}
-        if s < b.start_tick or e > b.end_tick:
+        if s < b.start_tick or e > b.end_tick or s < self.now or e <= self.now:
             return 400, {"error": {"code": "validation_error", "message": "x"}}
         b.start_tick, b.end_tick = s, e
         p = self._scan(b.room)
@@ -157,16 +161,23 @@ class ReferenceModel:
         if target == self.now:
             return 200, {"now": self.now, "expired": [], "promoted": {}}
         self.now = target
-        expired = sorted(
+        held_expired = sorted(
             (b for b in self.bookings.values()
-             if b.status == "held" and b.expires_at <= target),
+             if b.status == "held"
+             and (b.expires_at <= target or b.start_tick < target)),
             key=lambda b: b.id,
         )
+        stale_waiting = sorted(
+            (b for b in self.bookings.values()
+             if b.status == "waiting" and b.start_tick < target),
+            key=lambda b: b.id,
+        )
+        expired = sorted(held_expired + stale_waiting, key=lambda b: b.id)
         for b in expired:
             b.status = "expired"
             b.expires_at = None
         promoted = {}
-        for room in sorted({b.room for b in expired}):
+        for room in sorted({b.room for b in held_expired}):
             p = self._scan(room)
             if p:
                 promoted[str(room)] = p
@@ -218,12 +229,18 @@ def assert_invariants(ref):
                 assert not _overlaps(
                     a.start_tick, a.end_tick, b.start_tick, b.end_tick
                 ), f"重叠: {a.dict()} vs {b.dict()}"
-    # 2. held 必须未过期且 expires_at > now
+    # 2. held 必须未过期且其预约起点尚未被时钟越过
     for b in active:
         if b.status == "held":
-            assert b.expires_at is not None and b.expires_at > ref.now
-    # 3. 候补按 id FIFO
+            assert (
+                b.start_tick >= ref.now
+                and b.expires_at is not None
+                and b.expires_at > ref.now
+            )
+    # 3. 候补仍必须能取得当前或未来的完整时段，并按 id FIFO
     waiting = [b for b in ref.bookings.values() if b.status == "waiting"]
+    for b in waiting:
+        assert b.start_tick >= ref.now
     assert [b.id for b in waiting] == sorted(b.id for b in waiting)
 
 
@@ -247,7 +264,7 @@ def test_differential_against_reference_model(tmp_path, seed):
         return r.status_code, r.json()
 
     def random_interval():
-        s = rng.randrange(0, 40)
+        s = ref.now + rng.randrange(0, 40)
         e = s + rng.choice([1, 2, 3, 5, 10, 20])
         return s, e
 

@@ -10,17 +10,24 @@
 - 时间为半开整数区间 `[start_tick, end_tick)`，相邻区间
   （`a.end == b.start`）**不冲突**；冲突只在**同一房间**内判定。
 - 状态机：
-  - `held`：限时保留，`expires_at = 创建时刻 + ttl`；
-  - `reserved`：已确认，永不过期；
-  - `waiting`：候补，按自增 id（入队顺序）FIFO；
+  - `held`：限时保留，`expires_at = 创建时刻 + ttl`；到达保留截止点或预约
+    起点被当前时钟越过后均不可确认；
+  - `reserved`：已确认，不会因时钟推进自动过期；
+  - `waiting`：候补，按自增 id（入队顺序）FIFO；预约起点被时钟越过后立即
+    进入 `expired`，不能在已过去的时段上被晋升；
   - `expired` / `cancelled`：终态。
-- **过期判定**：时钟推进到 `t` 时，所有 `expires_at <= t` 的 held 过期。
-  过期、扫描、晋升与时钟更新在同一 `BEGIN IMMEDIATE` 事务中完成。
-- **候补晋升**：候补按 FIFO 逐个检查，能完整放进当前空档才晋升为 held
-  （`expires_at = 当前时刻 + PROMOTION_TTL`）；放不下则保留 waiting 并继续
-  检查后面的申请——不拆分、不丢弃顺序。
+- **过期判定**：时钟推进到 `t` 时，所有 `expires_at <= t` 或 `start_tick < t`
+  的 held 过期；所有 `start_tick < t` 的 waiting 过期。过期、扫描、晋升与时钟
+  更新在同一 `BEGIN IMMEDIATE` 事务中完成。
+- **候补晋升**：候补按 FIFO 逐个检查，只有仍能取得**当前或未来的完整时段**
+  （`start_tick >= 当前时刻`）才晋升为 held（`expires_at = 当前时刻 +
+  PROMOTION_TTL`）；已过去的候选项直接终态化，放不下的未来候选项保留 waiting
+  并继续检查后面的申请——不拆分、不丢弃顺序。
 - **取消/缩短**：仅 held/reserved 释放容量并触发同房间候补扫描；
-  取消 waiting 不释放容量。缩短只允许在原区间范围内收紧。
+  取消 waiting 不释放容量。缩短只允许在原区间范围内收紧，且缩短后的区间必须
+  仍在当前时钟之后。
+- **新申请**：不接受 `start_tick < 当前时钟` 的过去时段；`start_tick == 当前时钟`
+  是最后可申请/晋升的边界。
 - **并发**：所有写事务均为 `BEGIN IMMEDIATE`，SQLite 库级写锁将冲突申请
   串行化，因此同一空档的并发请求**恰好一个**拿到 held，其余按落库顺序
   成为候补（`busy_timeout=30s`）。
